@@ -1,0 +1,85 @@
+#===============================================================================
+# Vagrantfile for Deploying an Ansible Controller Node on VirtualBox
+#
+# Description:
+#   This Vagrantfile sets up a single virtual machine running Ubuntu (bionic64) that will
+#   serve as an Ansible controller. It performs the following:
+#     1. Uses VirtualBox as the provider.
+#     2. Configures a private network (DHCP).
+#     3. Customizes VM resources (memory, CPU).
+#     4. Installs Ansible, Ansible Lint, and Ansible Vault via inline shell provisioning.
+#     5. Creates a synced folder between host and guest for sharing playbooks or configuration.
+#     6. Enables SSH agent forwarding for convenient key management.
+#
+# Prerequisites:
+#   - VirtualBox and Vagrant must be installed on your host machine.
+#   - Ensure that the OpenShift credentials and other sensitive information are secured.
+#
+# Disclaimer:
+#   This file is provided "as is" without any warranty of any kind. Use at your own risk.
+#
+# Author: Your Name or Organization
+# Date:   2025-04-14
+# Version: 1.1
+#===============================================================================
+
+Vagrant.configure("2") do |config|
+  # Define the single VM that will serve as the Ansible controller.
+  config.vm.define "controller" do |controller|
+    # Specify the base box for the VM; here we use Ubuntu Bionic 64-bit.
+    controller.vm.box = "ubuntu/bionic64"
+    controller.vm.hostname = "ansible-controller"
+
+    # Configure a private network with DHCP.
+    controller.vm.network "private_network", type: "dhcp"
+
+    #----------------------------------------------
+    # Provider Configuration: VirtualBox
+    #----------------------------------------------
+    controller.vm.provider "virtualbox" do |vb|
+      # Set the memory and CPU count for the VM.
+      vb.memory = "1024"    # Increase memory allocation if necessary.
+      vb.cpus = 2           # Set the number of virtual CPUs.
+      # You can add additional VirtualBox configuration parameters here if needed.
+    end
+
+    #----------------------------------------------
+    # Provisioning: Install Ansible and Required Tools
+    #----------------------------------------------
+    controller.vm.provision "shell", inline: <<-SHELL
+      # Update package list and install prerequisites.
+      sudo apt-get update
+      sudo apt-get install -y software-properties-common curl git
+
+      # Add the Ansible PPA and update package lists.
+      sudo apt-add-repository --yes --update ppa:ansible/ansible
+
+      # Install Ansible.
+      sudo apt-get install -y ansible
+
+      # Install Python3-pip and Ansible Lint for additional validation.
+      sudo apt-get install -y python3-pip
+      pip3 install --user ansible-lint
+
+      # Install Ansible Vault.
+      sudo apt-get install -y ansible-vault
+
+      # Verify the installations.
+      ansible --version
+      ansible-lint --version
+      ansible-vault --version
+    SHELL
+
+    #----------------------------------------------
+    # Synced Folder
+    #----------------------------------------------
+    # Sync the local "./ansible" folder to "/vagrant_ansible" inside the VM. Customize as needed.
+    controller.vm.synced_folder "./ansible", "/vagrant_ansible"
+
+    #----------------------------------------------
+    # SSH Agent Forwarding
+    #----------------------------------------------
+    # Enable SSH agent forwarding for simpler SSH key usage from the host to the guest.
+    controller.ssh.forward_agent = true
+  end
+end
