@@ -1,3 +1,50 @@
+#-----------------------------
+# Dynamic VM Scaling
+#-----------------------------
+WEB_COUNT = 2
+DB_COUNT = 1
+#-----------------------------
+# Centralized Logging
+#-----------------------------
+LOG_DIR = "./ansible/logs"
+Dir.mkdir(LOG_DIR) unless Dir.exist?(LOG_DIR)
+#-----------------------------
+# Custom Networking Topologies
+#-----------------------------
+NETWORKS = [
+  { name: "nat", type: "private_network", ip: nil },
+  { name: "hostonly", type: "private_network", ip: nil },
+  # Add more network types as needed
+]
+#-----------------------------
+# Automated Package Updates
+#-----------------------------
+AUTO_UPDATE_PACKAGES = true
+#-----------------------------
+# Lab Reset Command
+#-----------------------------
+LAB_RESET_SCRIPT = "./reset_lab.sh"
+  #-----------------------------
+  # Automated Documentation Generation
+  #-----------------------------
+  DOC_GEN_SCRIPT = "./generate_lab_docs.sh"
+  config.trigger.after :up do |trigger|
+    trigger.run = {
+      inline: <<-SHELL
+        if [ -f #{DOC_GEN_SCRIPT} ]; then
+          echo "Generating lab documentation..."
+          bash #{DOC_GEN_SCRIPT}
+        else
+          echo "Documentation script not found: #{DOC_GEN_SCRIPT}"
+        fi
+      SHELL
+    }
+  end
+  # Advanced Networking: Port forwarding for web and db nodes
+  web.vm.network "forwarded_port", guest: 80, host: 8080, id: "http"
+  # Example: Enable public network (uncomment to use)
+  # web.vm.network "public_network", bridge: "en0: Wi-Fi (Wireless)", ip: "192.168.1.100"
+  db.vm.network "forwarded_port", guest: 3306, host: 33060, id: "mysql"
   #-----------------------------
   # Box Caching and Updates
   #-----------------------------
@@ -115,65 +162,187 @@ end
 #===============================================================================
 
 
-#-----------------------------
+################################################################################
 # Configurable Parameters
-#-----------------------------
+# These variables control VM resources, networking, and provisioning features.
+# Adjust them to customize your Ansible lab environment.
+################################################################################
 VM_BOX = "ubuntu/focal64" # Use Ubuntu 20.04 LTS
 VM_BOX_VERSION = "20240403.0.0" # Pin box version for reproducibility
 VM_HOSTNAME_CONTROLLER = "ansible-controller"
 VM_HOSTNAME_PREFIX_TARGET = "ansible-target"
 VM_MEMORY_CONTROLLER = 2048
 VM_CPUS_CONTROLLER = 2
+VM_DISK_SIZE_CONTROLLER = 20480 # Disk size in MB for controller
 VM_MEMORY_TARGET = 1024
-VM_CPUS_TARGET = 1
-NUM_TARGETS = 2 # Number of target VMs
-SYNCED_FOLDER_SRC = "./ansible"
-SYNCED_FOLDER_DEST = "/vagrant_ansible"
-PORT_FORWARD_SSH = 2222 # Host port for controller SSH
-STATIC_IP_BASE = "192.168.56."
-STATIC_IP_START = 10
-PROVIDERS = ["virtualbox", "vmware_desktop", "hyperv"] # Multi-provider support
-
-#-----------------------------
-# Helper: Generate Static IPs
-#-----------------------------
-def static_ip(index)
-  "#{STATIC_IP_BASE}#{STATIC_IP_START + index}"
-end
-
-
-
-Vagrant.configure("2") do |config|
-  #-----------------------------
-  # Controller Node
-  #-----------------------------
-  config.vm.define "controller" do |controller|
-    controller.vm.box = VM_BOX
-    controller.vm.box_version = VM_BOX_VERSION
-    controller.vm.hostname = VM_HOSTNAME_CONTROLLER
-    controller.vm.network "private_network", ip: static_ip(0)
-    controller.vm.network "forwarded_port", guest: 22, host: PORT_FORWARD_SSH, id: "ssh"
-    # Multi-provider support
-    PROVIDERS.each do |prov|
-      controller.vm.provider prov do |vb|
-        vb.memory = VM_MEMORY_CONTROLLER
-        vb.cpus = VM_CPUS_CONTROLLER
-        vb.customize ["modifyvm", :id, "--description", "Ansible Controller"] if prov == "virtualbox"
+  # Example: Role-based VM creation
+  # Dynamic web nodes
+  WEB_COUNT.times do |i|
+    config.vm.define "web#{i+1}" do |web|
+      web.vm.box = VM_BOX
+      web.vm.box_version = VM_BOX_VERSION
+      web.vm.hostname = "web-node#{i+1}"
+      web.vm.network "private_network", ip: static_ip(1 + i)
+      web.vm.network "forwarded_port", guest: 80, host: 8080 + i, id: "http#{i+1}"
+      PROVIDERS.each do |prov|
+        web.vm.provider prov do |vb|
+          vb.memory = 1024
+          vb.cpus = 1
+          vb.customize ["modifyvm", :id, "--description", "Web Node #{i+1}"] if prov == "virtualbox"
+          vb.customize ["modifyvm", :id, "--vrdxvmsize", 10240] if prov == "virtualbox"
+        end
+      end
+      ENV_VARS.each { |k, v| web.vm.env.push({ k => v }) }
+      RESOURCE_TAGS.merge({"role" => "web"}).each { |k, v| web.vm.provider "virtualbox" do |vb| vb.customize ["setextradata", :id, "VBoxInternal/Tags/#{k}", v] end }
+      # Custom networking topologies
+      NETWORKS.each do |net|
+        web.vm.network net[:type], ip: net[:ip] if net[:ip]
+      end
+      web.vm.provision "shell", inline: <<-SHELL
+        set -e
+        trap 'echo "[ERROR] Provisioning failed on web-node#{i+1}!" >&2; exit 1' ERR
+        export DEBIAN_FRONTEND=noninteractive
+        sudo apt-get update
+        sudo apt-get install -y curl git python3-pip htop glances nginx
+        if ! id #{CUSTOM_USER} >/dev/null 2>&1; then
+          sudo adduser --disabled-password --gecos "" #{CUSTOM_USER}
+          sudo usermod -aG sudo #{CUSTOM_USER}
+          sudo mkdir -p /home/#{CUSTOM_USER}/.ssh
+          if [ -f #{CUSTOM_USER_PUBKEY} ]; then
+            sudo cp #{CUSTOM_USER_PUBKEY} /home/#{CUSTOM_USER}/.ssh/authorized_keys
+          fi
+          sudo chown -R #{CUSTOM_USER}:#{CUSTOM_USER} /home/#{CUSTOM_USER}/.ssh
+          sudo chmod 600 /home/#{CUSTOM_USER}/.ssh/authorized_keys
+        fi
+        sudo mkdir -p /etc/ansible/facts.d
+        echo '{"role": "web", "lab_type": "advanced", "owner": "Dewain"}' | sudo tee /etc/ansible/facts.d/lab.json
+        htop --version
+        glances --version
+        nginx -v
+        sudo apt-get clean
+        # Automated package updates
+        if #{AUTO_UPDATE_PACKAGES}; then
+          sudo apt-get upgrade -y
+        fi
+        # Centralized logging
+        echo "Web Node #{i+1} provisioned at $(date)" >> #{LOG_DIR}/web#{i+1}.log
+      SHELL
+      web.vm.provision "shell", inline: <<-SHELL
+        echo "[HEALTH CHECK] Web Node #{i+1}:"
+        ping -c 2 127.0.0.1 && echo "Ping successful."
+        systemctl status ssh | head -n 10 || echo "SSH service status check failed."
+        systemctl status nginx | head -n 10 || echo "Nginx service status check failed."
+        # Centralized logging
+        echo "Web Node #{i+1} health check at $(date)" >> #{LOG_DIR}/web#{i+1}.log
+      SHELL
+      if ENABLE_SNAPSHOTS
+        web.vm.provider "virtualbox" do |vb|
+          vb.customize ["snapshot", :id, "take", "initial"]
+        end
       end
     end
-    controller.vm.synced_folder SYNCED_FOLDER_SRC, SYNCED_FOLDER_DEST, type: "virtualbox"
-    controller.ssh.forward_agent = true
-    controller.vm.provision "shell", inline: <<-SHELL
-      set -e
-      trap 'echo "[ERROR] Provisioning failed on controller!" >&2; exit 1' ERR
-      export DEBIAN_FRONTEND=noninteractive
-      sudo apt-get update
-      sudo apt-get install -y software-properties-common curl git python3-pip
-      if ! apt-cache policy | grep -q ansible; then
-        sudo apt-add-repository --yes --update ppa:ansible/ansible
-      fi
-      sudo apt-get update
-      sudo apt-get install -y ansible
+  end
+
+  # Dynamic db nodes
+  DB_COUNT.times do |i|
+    config.vm.define "db#{i+1}" do |db|
+      db.vm.box = VM_BOX
+      db.vm.box_version = VM_BOX_VERSION
+      db.vm.hostname = "db-node#{i+1}"
+      db.vm.network "private_network", ip: static_ip(1 + WEB_COUNT + i)
+      db.vm.network "forwarded_port", guest: 3306, host: 33060 + i, id: "mysql#{i+1}"
+      PROVIDERS.each do |prov|
+        db.vm.provider prov do |vb|
+          vb.memory = 1024
+          vb.cpus = 1
+          vb.customize ["modifyvm", :id, "--description", "DB Node #{i+1}"] if prov == "virtualbox"
+          vb.customize ["modifyvm", :id, "--vrdxvmsize", 10240] if prov == "virtualbox"
+        end
+      end
+      ENV_VARS.each { |k, v| db.vm.env.push({ k => v }) }
+      RESOURCE_TAGS.merge({"role" => "db"}).each { |k, v| db.vm.provider "virtualbox" do |vb| vb.customize ["setextradata", :id, "VBoxInternal/Tags/#{k}", v] end }
+      NETWORKS.each do |net|
+        db.vm.network net[:type], ip: net[:ip] if net[:ip]
+      end
+      db.vm.provision "shell", inline: <<-SHELL
+        set -e
+        trap 'echo "[ERROR] Provisioning failed on db-node#{i+1}!" >&2; exit 1' ERR
+        export DEBIAN_FRONTEND=noninteractive
+        sudo apt-get update
+        sudo apt-get install -y curl git python3-pip htop glances mysql-server
+        if ! id #{CUSTOM_USER} >/dev/null 2>&1; then
+          sudo adduser --disabled-password --gecos "" #{CUSTOM_USER}
+          sudo usermod -aG sudo #{CUSTOM_USER}
+          sudo mkdir -p /home/#{CUSTOM_USER}/.ssh
+          if [ -f #{CUSTOM_USER_PUBKEY} ]; then
+            sudo cp #{CUSTOM_USER_PUBKEY} /home/#{CUSTOM_USER}/.ssh/authorized_keys
+          fi
+          sudo chown -R #{CUSTOM_USER}:#{CUSTOM_USER} /home/#{CUSTOM_USER}/.ssh
+          sudo chmod 600 /home/#{CUSTOM_USER}/.ssh/authorized_keys
+        fi
+        sudo mkdir -p /etc/ansible/facts.d
+        echo '{"role": "db", "lab_type": "advanced", "owner": "Dewain"}' | sudo tee /etc/ansible/facts.d/lab.json
+        htop --version
+        glances --version
+        mysql --version
+        sudo apt-get clean
+        # Automated package updates
+        if #{AUTO_UPDATE_PACKAGES}; then
+          sudo apt-get upgrade -y
+        fi
+        # Centralized logging
+        echo "DB Node #{i+1} provisioned at $(date)" >> #{LOG_DIR}/db#{i+1}.log
+      SHELL
+      db.vm.provision "shell", inline: <<-SHELL
+        echo "[HEALTH CHECK] DB Node #{i+1}:"
+        ping -c 2 127.0.0.1 && echo "Ping successful."
+        systemctl status ssh | head -n 10 || echo "SSH service status check failed."
+        systemctl status mysql | head -n 10 || echo "MySQL service status check failed."
+        # Centralized logging
+        echo "DB Node #{i+1} health check at $(date)" >> #{LOG_DIR}/db#{i+1}.log
+      SHELL
+      if ENABLE_SNAPSHOTS
+        db.vm.provider "virtualbox" do |vb|
+          vb.customize ["snapshot", :id, "take", "initial"]
+        end
+      end
+    end
+  end
+  #-----------------------------
+  # VM Health Dashboard Generation
+  #-----------------------------
+  DASHBOARD_FILE = "./ansible/lab_dashboard.md"
+  config.trigger.after :up do |trigger|
+    trigger.run = {
+      inline: <<-SHELL
+        echo "# Lab VM Health Dashboard" > #{DASHBOARD_FILE}
+        for i in $(seq 1 #{WEB_COUNT}); do
+          echo "## Web Node $i" >> #{DASHBOARD_FILE}
+          cat #{LOG_DIR}/web${i}.log >> #{DASHBOARD_FILE}
+        done
+        for i in $(seq 1 #{DB_COUNT}); do
+          echo "## DB Node $i" >> #{DASHBOARD_FILE}
+          cat #{LOG_DIR}/db${i}.log >> #{DASHBOARD_FILE}
+        done
+      SHELL
+    }
+  end
+
+  #-----------------------------
+  # Lab Reset Command Trigger
+  #-----------------------------
+  config.trigger.after :destroy do |trigger|
+    trigger.run = {
+      inline: <<-SHELL
+        if [ -f #{LAB_RESET_SCRIPT} ]; then
+          echo "Resetting lab environment..."
+          bash #{LAB_RESET_SCRIPT}
+        else
+          echo "Lab reset script not found: #{LAB_RESET_SCRIPT}"
+        fi
+      SHELL
+    }
+  end
       pip3 install --user --upgrade ansible-lint ansible-vault
       # Custom user and SSH key setup
       if ! id #{CUSTOM_USER} >/dev/null 2>&1; then
@@ -198,13 +367,18 @@ Vagrant.configure("2") do |config|
       ansible --version
       ansible-lint --version
       ansible-vault --version
+      htop --version
+      glances --version
       sudo apt-get clean
     SHELL
   end
 
-  #-----------------------------
-  # Target Nodes (Prepared for Expansion)
-  #-----------------------------
+  ################################################################################
+  # Target Nodes
+  # These VMs act as playbook targets. You can expand this section for role-based
+  # VM creation (e.g., web, db, app) by adding more configuration and provisioning
+  # logic per role.
+  ################################################################################
   NUM_TARGETS.times do |i|
     config.vm.define "target#{i+1}" do |target|
       target.vm.box = VM_BOX
@@ -216,6 +390,7 @@ Vagrant.configure("2") do |config|
           vb.memory = VM_MEMORY_TARGET
           vb.cpus = VM_CPUS_TARGET
           vb.customize ["modifyvm", :id, "--description", "Ansible Target Node #{i+1}"] if prov == "virtualbox"
+          vb.customize ["modifyvm", :id, "--vrdxvmsize", VM_DISK_SIZE_TARGET] if prov == "virtualbox"
         end
       end
       # Custom user and SSH key setup for target nodes
@@ -224,7 +399,7 @@ Vagrant.configure("2") do |config|
         trap 'echo "[ERROR] Provisioning failed on target#{i+1}!" >&2; exit 1' ERR
         export DEBIAN_FRONTEND=noninteractive
         sudo apt-get update
-        sudo apt-get install -y curl git python3-pip
+        sudo apt-get install -y curl git python3-pip htop glances
         if ! id #{CUSTOM_USER} >/dev/null 2>&1; then
           sudo adduser --disabled-password --gecos "" #{CUSTOM_USER}
           sudo usermod -aG sudo #{CUSTOM_USER}
@@ -235,10 +410,12 @@ Vagrant.configure("2") do |config|
           sudo chown -R #{CUSTOM_USER}:#{CUSTOM_USER} /home/#{CUSTOM_USER}/.ssh
           sudo chmod 600 /home/#{CUSTOM_USER}/.ssh/authorized_keys
         fi
-  # Inject custom Ansible facts
-  sudo mkdir -p /etc/ansible/facts.d
-  echo '{"lab_type": "advanced", "owner": "Dewain"}' | sudo tee /etc/ansible/facts.d/lab.json
-  sudo apt-get clean
+        # Inject custom Ansible facts
+        sudo mkdir -p /etc/ansible/facts.d
+        echo '{"lab_type": "advanced", "owner": "Dewain"}' | sudo tee /etc/ansible/facts.d/lab.json
+        htop --version
+        glances --version
+        sudo apt-get clean
       SHELL
     end
   end
