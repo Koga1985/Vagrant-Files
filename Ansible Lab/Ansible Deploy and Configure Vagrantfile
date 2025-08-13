@@ -1,8 +1,99 @@
+  #-----------------------------
+  # Box Caching and Updates
+  #-----------------------------
+  config.trigger.before :up do |trigger|
+    trigger.run = {
+      inline: <<-SHELL
+        echo "Ensuring latest box version is cached..."
+        vagrant box update --box #{VM_BOX}
+      SHELL
+    }
+  end
+  #-----------------------------
+  # Automated Cleanup Trigger
+  #-----------------------------
+  config.trigger.after :destroy do |trigger|
+    trigger.run = {
+      inline: <<-SHELL
+        echo "Lab environment destroyed. Cleaning up resources..."
+        rm -f #{INVENTORY_FILE}
+        # Add additional cleanup steps here
+      SHELL
+    }
+  end
+#-----------------------------
+# Playbook Provisioning
+#-----------------------------
+CUSTOM_PLAYBOOK = "./ansible/site.yml" # Playbook to run during provisioning
+    # Optionally run a custom playbook during provisioning
+    if File.exist?(CUSTOM_PLAYBOOK)
+      controller.vm.provision "ansible" do |ansible|
+        ansible.playbook = CUSTOM_PLAYBOOK
+        ansible.inventory_path = INVENTORY_FILE
+        ansible.limit = "all"
+        ansible.vault_password_file = SECRETS_FILE if File.exist?(SECRETS_FILE)
+      end
+    end
+#-----------------------------
+# Custom Ansible Facts
+#-----------------------------
+CUSTOM_FACTS = { "lab_type" => "advanced", "owner" => "Dewain" }
+#-----------------------------
+# Secrets Management (Ansible Vault)
+#-----------------------------
+SECRETS_FILE = "./ansible/.vault_pass"
+    # Health check after provisioning (controller)
+    controller.vm.provision "shell", inline: <<-SHELL
+      echo "[HEALTH CHECK] Controller VM:"
+      ping -c 2 127.0.0.1 && echo "Ping successful."
+      systemctl status ssh | head -n 10 || echo "SSH service status check failed."
+    SHELL
+      # Health check after provisioning (target)
+      target.vm.provision "shell", inline: <<-SHELL
+        echo "[HEALTH CHECK] Target VM #{i+1}:"
+        ping -c 2 127.0.0.1 && echo "Ping successful."
+        systemctl status ssh | head -n 10 || echo "SSH service status check failed."
+      SHELL
+#-----------------------------
+# Custom User and SSH Key Setup
+#-----------------------------
+CUSTOM_USER = "ansibleuser"
+CUSTOM_USER_PUBKEY = "~/.ssh/id_rsa.pub" # Path to public key for custom user
+#-----------------------------
+# Inventory Generation Helper
+#-----------------------------
+INVENTORY_FILE = "./ansible/inventory.ini"
+
+def write_inventory(controller_ip, target_ips)
+  File.open(INVENTORY_FILE, "w") do |f|
+    f.puts "[controller]"
+    f.puts controller_ip
+    f.puts "\n[target]"
+    target_ips.each { |ip| f.puts ip }
+  end
+end
+  #-----------------------------
+  # Inventory Generation Trigger
+  #-----------------------------
+  config.vm.post_up_message = "Generating Ansible inventory file..."
+  config.trigger.after :up do |trigger|
+    trigger.run = {
+      inline: <<-SHELL
+        echo "[controller]" > #{INVENTORY_FILE}
+        echo "#{static_ip(0)}" >> #{INVENTORY_FILE}
+        echo "\n[target]" >> #{INVENTORY_FILE}
+        for i in $(seq 1 #{NUM_TARGETS}); do
+          echo "#{static_ip(i)}" >> #{INVENTORY_FILE}
+        done
+      SHELL
+    }
+  end
+
 #===============================================================================
 # Vagrantfile for Deploying an Ansible Controller Node on VirtualBox
 #
 # Description:
-#   This Vagrantfile sets up a single virtual machine running Ubuntu (bionic64) that will
+#   This Vagrantfile sets up a single virtual machine running Ubuntu (focal64) that will
 #   serve as an Ansible controller. It performs the following:
 #     1. Uses VirtualBox as the provider.
 #     2. Configures a private network (DHCP).
@@ -19,67 +110,136 @@
 #   This file is provided "as is" without any warranty of any kind. Use at your own risk.
 #
 # Author: Dewain Smith, #TheBeardedEngineer
-# Date:   2025-04-14
-# Version: 1.1
+# Date:   2025-08-13
+# Version: 1.2
 #===============================================================================
 
+
+#-----------------------------
+# Configurable Parameters
+#-----------------------------
+VM_BOX = "ubuntu/focal64" # Use Ubuntu 20.04 LTS
+VM_BOX_VERSION = "20240403.0.0" # Pin box version for reproducibility
+VM_HOSTNAME_CONTROLLER = "ansible-controller"
+VM_HOSTNAME_PREFIX_TARGET = "ansible-target"
+VM_MEMORY_CONTROLLER = 2048
+VM_CPUS_CONTROLLER = 2
+VM_MEMORY_TARGET = 1024
+VM_CPUS_TARGET = 1
+NUM_TARGETS = 2 # Number of target VMs
+SYNCED_FOLDER_SRC = "./ansible"
+SYNCED_FOLDER_DEST = "/vagrant_ansible"
+PORT_FORWARD_SSH = 2222 # Host port for controller SSH
+STATIC_IP_BASE = "192.168.56."
+STATIC_IP_START = 10
+PROVIDERS = ["virtualbox", "vmware_desktop", "hyperv"] # Multi-provider support
+
+#-----------------------------
+# Helper: Generate Static IPs
+#-----------------------------
+def static_ip(index)
+  "#{STATIC_IP_BASE}#{STATIC_IP_START + index}"
+end
+
+
+
 Vagrant.configure("2") do |config|
-  # Define the single VM that will serve as the Ansible controller.
+  #-----------------------------
+  # Controller Node
+  #-----------------------------
   config.vm.define "controller" do |controller|
-    # Specify the base box for the VM; here we use Ubuntu Bionic 64-bit.
-    controller.vm.box = "ubuntu/bionic64"
-    controller.vm.hostname = "ansible-controller"
-
-    # Configure a private network with DHCP.
-    controller.vm.network "private_network", type: "dhcp"
-
-    #----------------------------------------------
-    # Provider Configuration: VirtualBox
-    #----------------------------------------------
-    controller.vm.provider "virtualbox" do |vb|
-      # Set the memory and CPU count for the VM.
-      vb.memory = "1024"    # Increase memory allocation if necessary.
-      vb.cpus = 2           # Set the number of virtual CPUs.
-      # You can add additional VirtualBox configuration parameters here if needed.
+    controller.vm.box = VM_BOX
+    controller.vm.box_version = VM_BOX_VERSION
+    controller.vm.hostname = VM_HOSTNAME_CONTROLLER
+    controller.vm.network "private_network", ip: static_ip(0)
+    controller.vm.network "forwarded_port", guest: 22, host: PORT_FORWARD_SSH, id: "ssh"
+    # Multi-provider support
+    PROVIDERS.each do |prov|
+      controller.vm.provider prov do |vb|
+        vb.memory = VM_MEMORY_CONTROLLER
+        vb.cpus = VM_CPUS_CONTROLLER
+        vb.customize ["modifyvm", :id, "--description", "Ansible Controller"] if prov == "virtualbox"
+      end
     end
-
-    #----------------------------------------------
-    # Provisioning: Install Ansible and Required Tools
-    #----------------------------------------------
+    controller.vm.synced_folder SYNCED_FOLDER_SRC, SYNCED_FOLDER_DEST, type: "virtualbox"
+    controller.ssh.forward_agent = true
     controller.vm.provision "shell", inline: <<-SHELL
-      # Update package list and install prerequisites.
+      set -e
+      trap 'echo "[ERROR] Provisioning failed on controller!" >&2; exit 1' ERR
+      export DEBIAN_FRONTEND=noninteractive
       sudo apt-get update
-      sudo apt-get install -y software-properties-common curl git
-
-      # Add the Ansible PPA and update package lists.
-      sudo apt-add-repository --yes --update ppa:ansible/ansible
-
-      # Install Ansible.
+      sudo apt-get install -y software-properties-common curl git python3-pip
+      if ! apt-cache policy | grep -q ansible; then
+        sudo apt-add-repository --yes --update ppa:ansible/ansible
+      fi
+      sudo apt-get update
       sudo apt-get install -y ansible
-
-      # Install Python3-pip and Ansible Lint for additional validation.
-      sudo apt-get install -y python3-pip
-      pip3 install --user ansible-lint
-
-      # Install Ansible Vault.
-      sudo apt-get install -y ansible-vault
-
-      # Verify the installations.
+      pip3 install --user --upgrade ansible-lint ansible-vault
+      # Custom user and SSH key setup
+      if ! id #{CUSTOM_USER} >/dev/null 2>&1; then
+        sudo adduser --disabled-password --gecos "" #{CUSTOM_USER}
+        sudo usermod -aG sudo #{CUSTOM_USER}
+        sudo mkdir -p /home/#{CUSTOM_USER}/.ssh
+        if [ -f #{CUSTOM_USER_PUBKEY} ]; then
+          sudo cp #{CUSTOM_USER_PUBKEY} /home/#{CUSTOM_USER}/.ssh/authorized_keys
+        fi
+        sudo chown -R #{CUSTOM_USER}:#{CUSTOM_USER} /home/#{CUSTOM_USER}/.ssh
+        sudo chmod 600 /home/#{CUSTOM_USER}/.ssh/authorized_keys
+      fi
+      # Ansible Vault secrets management
+      if [ -f #{SECRETS_FILE} ]; then
+        echo "Vault password file found at #{SECRETS_FILE}."
+      else
+        echo "Vault password file not found. Secrets will not be available." >&2
+      fi
+      # Inject custom Ansible facts
+      sudo mkdir -p /etc/ansible/facts.d
+      echo '{"lab_type": "advanced", "owner": "Dewain"}' | sudo tee /etc/ansible/facts.d/lab.json
       ansible --version
       ansible-lint --version
       ansible-vault --version
+      sudo apt-get clean
     SHELL
+  end
 
-    #----------------------------------------------
-    # Synced Folder
-    #----------------------------------------------
-    # Sync the local "./ansible" folder to "/vagrant_ansible" inside the VM. Customize as needed.
-    controller.vm.synced_folder "./ansible", "/vagrant_ansible"
-
-    #----------------------------------------------
-    # SSH Agent Forwarding
-    #----------------------------------------------
-    # Enable SSH agent forwarding for simpler SSH key usage from the host to the guest.
-    controller.ssh.forward_agent = true
+  #-----------------------------
+  # Target Nodes (Prepared for Expansion)
+  #-----------------------------
+  NUM_TARGETS.times do |i|
+    config.vm.define "target#{i+1}" do |target|
+      target.vm.box = VM_BOX
+      target.vm.box_version = VM_BOX_VERSION
+      target.vm.hostname = "#{VM_HOSTNAME_PREFIX_TARGET}#{i+1}"
+      target.vm.network "private_network", ip: static_ip(i+1)
+      PROVIDERS.each do |prov|
+        target.vm.provider prov do |vb|
+          vb.memory = VM_MEMORY_TARGET
+          vb.cpus = VM_CPUS_TARGET
+          vb.customize ["modifyvm", :id, "--description", "Ansible Target Node #{i+1}"] if prov == "virtualbox"
+        end
+      end
+      # Custom user and SSH key setup for target nodes
+      target.vm.provision "shell", inline: <<-SHELL
+        set -e
+        trap 'echo "[ERROR] Provisioning failed on target#{i+1}!" >&2; exit 1' ERR
+        export DEBIAN_FRONTEND=noninteractive
+        sudo apt-get update
+        sudo apt-get install -y curl git python3-pip
+        if ! id #{CUSTOM_USER} >/dev/null 2>&1; then
+          sudo adduser --disabled-password --gecos "" #{CUSTOM_USER}
+          sudo usermod -aG sudo #{CUSTOM_USER}
+          sudo mkdir -p /home/#{CUSTOM_USER}/.ssh
+          if [ -f #{CUSTOM_USER_PUBKEY} ]; then
+            sudo cp #{CUSTOM_USER_PUBKEY} /home/#{CUSTOM_USER}/.ssh/authorized_keys
+          fi
+          sudo chown -R #{CUSTOM_USER}:#{CUSTOM_USER} /home/#{CUSTOM_USER}/.ssh
+          sudo chmod 600 /home/#{CUSTOM_USER}/.ssh/authorized_keys
+        fi
+  # Inject custom Ansible facts
+  sudo mkdir -p /etc/ansible/facts.d
+  echo '{"lab_type": "advanced", "owner": "Dewain"}' | sudo tee /etc/ansible/facts.d/lab.json
+  sudo apt-get clean
+      SHELL
+    end
   end
 end
